@@ -20,6 +20,14 @@ def escape(s: str) -> str:
     return escaped_s
 
 
+def format_annotations(labels):
+    labels = [escape(label) for label in labels]
+    if len(labels) > 1:
+        return "Multiple annotations:\n• " + "\n• ".join(labels)
+    else:
+        return labels[0]
+
+
 def normalize_data(data, method):
     """Normalize data using specified method"""
     if method == "Min-max":
@@ -65,18 +73,18 @@ def formatted_next_tokens(next_tokens, label_name, val, num_top_tokens=5, new_li
     return f"{base_str}{new_line_token}----{new_line_token}{next_tokens_str}"
 
 
-def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=None, token_borders=False):
+def color_tokens(
+    tokens,
+    values,
+    metric_name,
+    normalization_method,
+    next_tokens=None,
+    token_borders=False,
+    annotations=None,
+):
     """
     Create HTML spans with background color for each token based on the corresponding value.
-    Includes a custom-styled tooltip for better readability of longer text.
-
-    If the normalization method is "White to Green", the color is white at the minimum value and green at the maximum value.
-    If the normalization method is "Red to Green", the color is red at the minimum value and green at the maximum value and white at the mean value.
     """
-    if not values:
-        return " ".join(tokens)
-
-    # Add CSS for custom tooltip styling
     tooltip_style = f"""
     <div>
     <style>
@@ -84,12 +92,19 @@ def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=
         position: relative;
         display: inline-block;
         padding: 0px 0px;
+        margin: 1px 0; 
         border-radius: 2px;
         box-sizing: border-box;
         border: 0.5px solid {"rgba(0, 0, 0, 0.3)" if token_borders else "transparent"};
+        z-index: 0;
+    }}
+    .token-container .span-annotation {{
+        border-bottom: 3px solid #8A2BE2;
+        padding-bottom: 4px;
+        position: relative;
     }}
     .token-container .token-span:hover {{
-        border-color: rgba(0, 0, 0, 0.1);
+        border-color: rgba(0, 0, 0, 0.2);
     }}
     .token-container .token-span:hover::after {{
         content: attr(data-tooltip);
@@ -98,7 +113,23 @@ def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=
         left: 50%;
         transform: translateX(-50%);
         padding: 5px 10px;
-        background: rgba(0, 0, 0, 0.8);
+        background: rgba(0, 0, 0, 0.7);
+        color: white;
+        border-radius: 4px;
+        font-size: 14px;
+        white-space: pre;
+        max-width: 1000px;
+        z-index: 10;
+        font-family: monospace;
+    }}
+    .token-container .span-annotation:hover::after {{
+        content: attr(data-tooltip);
+        position: absolute;
+        top: 100%;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 5px 10px;
+        background: rgba(0, 0, 0, 0.7);
         color: white;
         border-radius: 4px;
         font-size: 14px;
@@ -152,7 +183,7 @@ def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=
                 scale = min(1.0, val / cap)  # Scale relative to max value
                 green_intensity = 255
                 red_intensity = blue_intensity = int(255 * (1 - scale))
-            else:  # val < 0
+            else:
                 # Scale from white to red
                 scale = min(1.0, abs(val) / cap)  # Scale relative to max value
                 red_intensity = 255
@@ -165,7 +196,49 @@ def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=
         span = f'<span class="token-span" style="background-color: {color_str};" data-tooltip="{tooltip_content}">{token}</span>'
         colored_text.append(span)
 
-    return tooltip_style + " ".join(colored_text) + "</div></div>"
+    result = tooltip_style + " ".join(colored_text)
+
+    # Add span annotations if provided and enabled
+    if annotations:
+        # First, build a map of which tokens are covered by which annotations
+        token_annotations = [[] for _ in range(len(tokens))]
+        for anno in annotations:
+            for i in range(anno["start"], anno["end"]):
+                token_annotations[i].append(anno["label"])
+
+        # Find continuous spans of tokens with the same set of annotations
+        current_span = []
+        current_labels = None
+        spans_to_add = []
+
+        for i, labels in enumerate(token_annotations):
+            labels = sorted(labels)  # Sort labels for consistent comparison
+            if labels != current_labels:
+                if current_span and current_labels:  # Only add span if it had annotations
+                    label_text = format_annotations(current_labels)
+
+                    spans_to_add.append({"start": current_span[0], "end": current_span[-1] + 1, "label": label_text})
+                current_span = [i] if labels else []  # Only start new span if there are labels
+                current_labels = labels if labels else None
+            elif labels:  # Only extend span if there are labels
+                current_span.append(i)
+
+        # Add the last span if it had annotations
+        if current_span and current_labels:
+            label_text = format_annotations(current_labels)
+
+            spans_to_add.append({"start": current_span[0], "end": current_span[-1] + 1, "label": label_text})
+
+        # Apply the combined spans
+        for span in spans_to_add:
+            start, end = span["start"], span["end"]
+            label = span["label"]
+            span_html = f'<span class="span-annotation" data-tooltip="{label}">'
+            tokens_html = " ".join(colored_text[start:end])
+            result = result.replace(tokens_html, f"{span_html}{tokens_html}</span>")
+
+    result += "</div></div>"
+    return result
 
 
 def create_token_plot(
@@ -280,6 +353,10 @@ st.markdown(
     - `tokens`: list of tokens (strings)
     - `metrics`: dictionary of metric_name -> list of float values (same length as tokens)
     - `next_tokens` (optional): list of dictionaries (same length as tokens), which each map from a possible next token to its associated probability (or logits)
+    - `annotations` (optional): list of span annotations, each with:
+        - `start`: starting token index
+        - `end`: ending token index (exclusive)
+        - `label`: annotation text
     """
 )
 
@@ -308,7 +385,6 @@ if data:
     current_line = data[line_index]
 
     tokens = current_line["tokens"]
-    print("Num tokens: ", len(tokens))
     metrics = {m: vs for m, vs in current_line["metrics"].items()}  # e.g. {"scoreA": [...], "scoreB": [...], ...}
 
     # Sanitize the tokens and next_tokens
@@ -327,10 +403,14 @@ if data:
             with col2:
                 selected_metric = st.radio("Choose a metric to color by", [f"`{m}`" for m in metric_list])
                 token_borders = st.checkbox("Show token borders", value=False)
+                if "annotations" in current_line:
+                    show_annotations = st.checkbox("Show annotations", value=True)
+                else:
+                    show_annotations = False
             # Retrieve the metric values for the chosen metric
             metric_values = metrics[selected_metric.strip("`")]
 
-            # Generate HTML for colored tokens
+            # Generate HTML for colored tokens with annotations
             colored_html = color_tokens(
                 tokens,
                 metric_values,
@@ -338,6 +418,7 @@ if data:
                 normalization_method=normalization_method,
                 next_tokens=current_line.get("next_tokens"),
                 token_borders=token_borders,
+                annotations=current_line.get("annotations") if show_annotations else None,
             )
             st.markdown(colored_html, unsafe_allow_html=True)
         else:
