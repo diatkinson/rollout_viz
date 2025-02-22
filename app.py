@@ -1,5 +1,7 @@
+import html
 import json
 import math
+import re
 from typing import Callable
 
 import numpy as np
@@ -13,12 +15,23 @@ from plotly.subplots import make_subplots
 ########################
 
 
+def escape(s: str) -> str:
+    escaped_s = re.sub("\n{2,}", "\n", html.escape(s)).replace("\n", "\\n")
+    return escaped_s
+
+
 def normalize_data(data, method):
     """Normalize data using specified method"""
     if method == "Min-max":
-        return (data - np.min(data)) / (np.max(data) - np.min(data))
+        if np.max(data) == np.min(data):
+            return np.ones_like(data) * 0.5
+        else:
+            return (data - np.min(data)) / (np.max(data) - np.min(data))
     elif method == "Z-score":
-        return (data - np.mean(data)) / np.std(data)
+        if np.std(data) == 0:
+            return np.zeros_like(data)
+        else:
+            return (data - np.mean(data)) / np.std(data)
     return data
 
 
@@ -52,7 +65,7 @@ def formatted_next_tokens(next_tokens, label_name, val, num_top_tokens=5, new_li
     return f"{base_str}{new_line_token}----{new_line_token}{next_tokens_str}"
 
 
-def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=None):
+def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=None, token_borders=False):
     """
     Create HTML spans with background color for each token based on the corresponding value.
     Includes a custom-styled tooltip for better readability of longer text.
@@ -64,14 +77,21 @@ def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=
         return " ".join(tokens)
 
     # Add CSS for custom tooltip styling
-    tooltip_style = """
+    tooltip_style = f"""
     <div>
     <style>
-    .token-container .token-span {
+    .token-container .token-span {{
         position: relative;
         display: inline-block;
-    }
-    .token-container .token-span:hover::after {
+        padding: 0px 0px;
+        border-radius: 2px;
+        box-sizing: border-box;
+        border: 0.5px solid {"rgba(0, 0, 0, 0.3)" if token_borders else "transparent"};
+    }}
+    .token-container .token-span:hover {{
+        border-color: rgba(0, 0, 0, 0.1);
+    }}
+    .token-container .token-span:hover::after {{
         content: attr(data-tooltip);
         position: absolute;
         bottom: 100%;
@@ -86,12 +106,12 @@ def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=
         max-width: 1000px;
         z-index: 1000;
         font-family: monospace;
-    }
+    }}
     </style>
     <div class="token-container">
     """
 
-    next_tokens = next_tokens or [None] * len(tokens)
+    next_tokens_lst = next_tokens or [None] * len(tokens)
     min_val = min(values)
     max_val = max(values)
     mean_val = sum(values) / len(values)
@@ -99,7 +119,7 @@ def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=
     max_abs_val = max(abs(max_val), abs(min_val))
 
     colored_text = []
-    for token, val, next_token in zip(tokens, values, next_tokens):
+    for token, val, next_tokens in zip(tokens, values, next_tokens_lst):
         # Normalize values according to the method
         if normalization_method == "White to Green":
             # Scale from 0 to 255 for green intensity
@@ -141,10 +161,7 @@ def color_tokens(tokens, values, metric_name, normalization_method, next_tokens=
         color_str = f"rgb({red_intensity},{green_intensity},{blue_intensity})"
 
         # Create a more detailed tooltip content
-        tooltip_content = f"{val:.3f}" if next_token is None else formatted_next_tokens(next_token, metric_name, val)
-        # Escape any quotes in the tooltip content
-        tooltip_content = tooltip_content.replace('"', "&quot;")
-
+        tooltip_content = f"{val:.3f}" if next_tokens is None else formatted_next_tokens(next_tokens, metric_name, val)
         span = f'<span class="token-span" style="background-color: {color_str};" data-tooltip="{tooltip_content}">{token}</span>'
         colored_text.append(span)
 
@@ -184,12 +201,10 @@ def create_token_plot(
     metric_names = list(metrics.keys())
     color_dict = {m: available_colors[i % len(available_colors)] for i, m in enumerate(metric_names)}
 
-    # Number of chunks (lines) we'll display
+    # Number of chunks (plot rows) we'll display
     num_chunks = math.ceil(len(tokens) / tokens_per_line)
 
-    # Create a subplot figure with one column and num_chunks rows
-    # The key change here is `shared_yaxes=True`
-    fig = make_subplots(rows=num_chunks, cols=1, shared_xaxes=False, shared_yaxes="all", vertical_spacing=0.08)
+    fig = make_subplots(rows=num_chunks, cols=1, shared_xaxes=False, shared_yaxes="all")
 
     # Iterate over chunks
     for chunk_index in range(num_chunks):
@@ -214,7 +229,6 @@ def create_token_plot(
                 for current_token, next_tokens, raw_value in zip(chunk_tokens, chunk_next_tokens, chunk_values)
             ]
 
-            # Add the line plot for this metric in the current chunk
             fig.add_trace(
                 go.Scatter(
                     x=list(range(len(chunk_tokens))),
@@ -225,7 +239,7 @@ def create_token_plot(
                     showlegend=(chunk_index == 0),
                     line=dict(color=color_dict[metric_name]),
                     hovertext=hover_text,
-                    hoverinfo="text",  # Show only the custom hover text
+                    hoverinfo="text",
                 ),
                 row=chunk_index + 1,
                 col=1,
@@ -233,11 +247,21 @@ def create_token_plot(
 
         # Update the x-axis for this row so tick labels show the actual tokens
         fig.update_xaxes(
-            tickmode="array", tickvals=list(range(len(chunk_tokens))), ticktext=chunk_tokens, row=chunk_index + 1, col=1
+            tickmode="array",
+            tickvals=list(range(len(chunk_tokens))),
+            ticktext=chunk_tokens,
+            row=chunk_index + 1,
+            col=1,
+            tickfont=dict(size=12),
         )
 
-    # Adjust figure layout
-    fig.update_layout(height=300 * num_chunks, showlegend=True, title="Token Metrics Plot")
+    fig.update_layout(
+        height=250 * num_chunks,
+        showlegend=True,
+        title="Token Metrics Plot",
+        margin=dict(t=30, b=10, l=10, r=10),
+        hovermode="closest",
+    )
 
     return fig
 
@@ -245,6 +269,8 @@ def create_token_plot(
 ########################
 # Streamlit interface
 ########################
+
+st.set_page_config(layout="wide")
 
 st.title("Rollout Metrics")
 
@@ -275,15 +301,22 @@ if data:
     col1, col2 = st.columns(2)
 
     with col1:
-        # 2. Text box (or number input) to choose the index of the line to display
         line_index = st.number_input("Line index to display", min_value=0, max_value=len(data) - 1, value=0)
-        # 3. Radio button to choose between text color or line plot
-        display_mode = st.radio("Display mode", ["Text Color", "Line Plot"])
+        display_mode = st.radio("Display mode", ["Text Color", "Line Plot (slow)"])
 
     # Retrieve the selected line data
     current_line = data[line_index]
+
     tokens = current_line["tokens"]
-    metrics = current_line["metrics"]  # e.g. {"scoreA": [...], "scoreB": [...], ...}
+    print("Num tokens: ", len(tokens))
+    metrics = {m: vs for m, vs in current_line["metrics"].items()}  # e.g. {"scoreA": [...], "scoreB": [...], ...}
+
+    # Sanitize the tokens and next_tokens
+    tokens = [escape(token) for token in tokens]
+    if current_line.get("next_tokens"):
+        current_line["next_tokens"] = [
+            {escape(token): prob for token, prob in next_tokens.items()} for next_tokens in current_line["next_tokens"]
+        ]
 
     if display_mode == "Text Color":
         # 4. If text color is chosen, let the user pick the metric
@@ -293,6 +326,7 @@ if data:
                 normalization_method = st.radio("Color Normalization", ["None", "White to Green", "Red to Green"])
             with col2:
                 selected_metric = st.radio("Choose a metric to color by", [f"`{m}`" for m in metric_list])
+                token_borders = st.checkbox("Show token borders", value=False)
             # Retrieve the metric values for the chosen metric
             metric_values = metrics[selected_metric.strip("`")]
 
@@ -300,12 +334,12 @@ if data:
             colored_html = color_tokens(
                 tokens,
                 metric_values,
-                selected_metric.strip("`"),
+                metric_name=selected_metric.strip("`"),
                 normalization_method=normalization_method,
                 next_tokens=current_line.get("next_tokens"),
+                token_borders=token_borders,
             )
             st.markdown(colored_html, unsafe_allow_html=True)
-
         else:
             with col2:
                 st.warning("No metrics found in this file.")
