@@ -10,15 +10,17 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+# Precompile regex for performance
+_COMPILED_NEWLINE_RE = re.compile(r"\n{2,}")
+
 ########################
 # Helper functions
 ########################
 
-
 def escape(s: str) -> str:
-    escaped_s = re.sub("\n{2,}", "\n", html.escape(s)).replace("\n", "\\n")
+    """Escape special characters and newlines using a precompiled regex."""
+    escaped_s = _COMPILED_NEWLINE_RE.sub("\n", html.escape(s)).replace("\n", "\\n")
     return escaped_s
-
 
 def format_annotations(labels):
     labels = [escape(label) for label in labels]
@@ -27,9 +29,9 @@ def format_annotations(labels):
     else:
         return labels[0]
 
-
 def normalize_data(data, method):
     """Normalize data using specified method"""
+    data = np.array(data, dtype=float)
     if method == "Min-max":
         if np.max(data) == np.min(data):
             return np.ones_like(data) * 0.5
@@ -42,8 +44,6 @@ def normalize_data(data, method):
             return (data - np.mean(data)) / np.std(data)
     return data
 
-
-#cache json loading
 @st.cache_data
 def load_jsonl(file):
     """
@@ -63,7 +63,6 @@ def load_jsonl(file):
             st.warning(f"Skipping malformed JSON line: {line[:50]}...")
     return lines
 
-
 def formatted_next_tokens(next_tokens, label_name, val, num_top_tokens=5, new_line_token="\n"):
     base_str = f"{label_name}: {val:.3f}"
     if next_tokens is None:
@@ -77,7 +76,6 @@ def formatted_next_tokens(next_tokens, label_name, val, num_top_tokens=5, new_li
     next_tokens_str = new_line_token.join([f"{token:<{max_token_len}} {prob:.3f}" for token, prob in top_tokens])
     return f"{base_str}{new_line_token}----{new_line_token}{next_tokens_str}"
 
-
 def color_tokens(
     tokens,
     values,
@@ -89,6 +87,7 @@ def color_tokens(
 ):
     """
     Create HTML spans with background color for each token based on the corresponding value.
+    Optimized using NumPy vectorized operations.
     """
     tooltip_style = f"""
     <div>
@@ -153,98 +152,79 @@ def color_tokens(
     mean_val = sum(values) / len(values)
     max_deviation = max(abs(max_val - mean_val), abs(min_val - mean_val))
     max_abs_val = max(abs(max_val), abs(min_val))
+    arr = np.array(values, dtype=float)
+
+    if normalization_method == "White to Green":
+        if max_val == min_val:
+            scale = np.full_like(arr, 0.5, dtype=float)
+        else:
+            scale = (arr - min_val) / (max_val - min_val)
+        red_intensities = (255 - (255 * scale)).astype(int)
+        blue_intensities = (255 - (255 * scale)).astype(int)
+        green_intensities = np.full(arr.shape, 255, dtype=int)
+    elif normalization_method == "Red to Green":
+        if max_deviation == 0:
+            scale = np.zeros_like(arr, dtype=float)
+        else:
+            scale = (arr - mean_val) / max_deviation
+        red_intensities = np.where(scale <= 0, 255, (255 * (1 - scale)).astype(int))
+        blue_intensities = np.where(scale <= 0, (255 * (1 + scale)).astype(int), (255 * (1 - scale)).astype(int))
+        green_intensities = np.where(scale <= 0, (255 * (1 + scale)).astype(int), 255)
+    elif normalization_method == "None":
+        cap = max_abs_val if max_abs_val > 0 else 1.0
+        scale = np.minimum(1.0, np.abs(arr) / cap)
+        red_intensities = np.where(arr > 0, (255 * (1 - scale)).astype(int), 255)
+        blue_intensities = np.where(arr > 0, (255 * (1 - scale)).astype(int),
+                                    np.where(arr < 0, (255 * (1 - scale)).astype(int), 255))
+        green_intensities = np.where(arr > 0, 255,
+                                     np.where(arr < 0, (255 * (1 - scale)).astype(int), 255))
+    else:
+        red_intensities = np.full(arr.shape, 255, dtype=int)
+        green_intensities = np.full(arr.shape, 255, dtype=int)
+        blue_intensities = np.full(arr.shape, 255, dtype=int)
 
     colored_text = []
-    for token, val, next_tokens in zip(tokens, values, next_tokens_lst):
-        # Normalize values according to the method
-        if normalization_method == "White to Green":
-            # Scale from 0 to 255 for green intensity
-            scale = (val - min_val) / (max_val - min_val) if max_val != min_val else 0.5
-            red_intensity = 255 - int(255 * scale)  # Fade from 255 to 0
-            green_intensity = 255  # Keep green at max
-            blue_intensity = 255 - int(255 * scale)  # Fade from 255 to 0
-        elif normalization_method == "Red to Green":
-            # Scale from -1 to 1 centered at mean
-            if max_deviation == 0:
-                scale = 0
-            else:
-                scale = (val - mean_val) / max_deviation
-
-            if scale <= 0:  # Red to White
-                red_intensity = 255
-                green_intensity = blue_intensity = int(255 * (1 + scale))
-            else:  # White to Green
-                green_intensity = 255
-                red_intensity = blue_intensity = int(255 * (1 - scale))
-        else:
-            # For unnormalized values: 0 is white, positive is green, negative is red
-            # Find the maximum absolute value for scaling
-            cap = max_abs_val if max_abs_val > 0 else 1.0
-
-            if val == 0:
-                red_intensity = green_intensity = blue_intensity = 255
-            elif val > 0:
-                # Scale from white to green
-                scale = min(1.0, val / cap)  # Scale relative to max value
-                green_intensity = 255
-                red_intensity = blue_intensity = int(255 * (1 - scale))
-            else:
-                # Scale from white to red
-                scale = min(1.0, abs(val) / cap)  # Scale relative to max value
-                red_intensity = 255
-                green_intensity = blue_intensity = int(255 * (1 - scale))
-
-        color_str = f"rgb({red_intensity},{green_intensity},{blue_intensity})"
-
-        # Create a more detailed tooltip content
-        tooltip_content = f"{val:.3f}" if next_tokens is None else formatted_next_tokens(next_tokens, metric_name, val)
+    for i, (token, nxt) in enumerate(zip(tokens, next_tokens_lst)):
+        color_str = f"rgb({red_intensities[i]},{green_intensities[i]},{blue_intensities[i]})"
+        tooltip_content = f"{values[i]:.3f}" if nxt is None else formatted_next_tokens(nxt, metric_name, values[i])
         span = f'<span class="token-span" style="background-color: {color_str};" data-tooltip="{tooltip_content}">{token}</span>'
         colored_text.append(span)
 
-    result = tooltip_style + " ".join(colored_text)
-
-    # Add span annotations if provided and enabled
+    # Process annotations if provided
     if annotations:
-        # First, build a map of which tokens are covered by which annotations
         token_annotations = [[] for _ in range(len(tokens))]
         for anno in annotations:
-            for i in range(anno["start"], anno["end"]):
-                token_annotations[i].append(anno["label"])
+            start, end, label = anno["start"], anno["end"], anno["label"]
+            for i in range(start, min(end, len(tokens))):
+                token_annotations[i].append(label)
 
-        # Find continuous spans of tokens with the same set of annotations
-        current_span = []
-        current_labels = None
         spans_to_add = []
-
+        current_start = None
+        current_labels = None
         for i, labels in enumerate(token_annotations):
-            labels = sorted(labels)  # Sort labels for consistent comparison
-            if labels != current_labels:
-                if current_span and current_labels:  # Only add span if it had annotations
-                    label_text = format_annotations(current_labels)
-
-                    spans_to_add.append({"start": current_span[0], "end": current_span[-1] + 1, "label": label_text})
-                current_span = [i] if labels else []  # Only start new span if there are labels
-                current_labels = labels if labels else None
-            elif labels:  # Only extend span if there are labels
-                current_span.append(i)
-
-        # Add the last span if it had annotations
-        if current_span and current_labels:
-            label_text = format_annotations(current_labels)
-
-            spans_to_add.append({"start": current_span[0], "end": current_span[-1] + 1, "label": label_text})
-
-        # Apply the combined spans
-        for span in spans_to_add:
-            start, end = span["start"], span["end"]
-            label = span["label"]
-            span_html = f'<span class="span-annotation" data-tooltip="{label}">'
+            labels_sorted = sorted(labels)
+            if labels_sorted != current_labels:
+                if current_labels is not None and current_start is not None:
+                    spans_to_add.append((current_start, i, format_annotations(current_labels)))
+                if labels:
+                    current_start = i
+                    current_labels = labels_sorted
+                else:
+                    current_start = None
+                    current_labels = None
+        if current_labels is not None and current_start is not None:
+            spans_to_add.append((current_start, len(tokens), format_annotations(current_labels)))
+        # Replace segments in colored_text with annotation-wrapped HTML
+        for start, end, label in spans_to_add:
             tokens_html = " ".join(colored_text[start:end])
-            result = result.replace(tokens_html, f"{span_html}{tokens_html}</span>")
+            span_html = f'<span class="span-annotation" data-tooltip="{label}">{tokens_html}</span>'
+            colored_text[start:end] = [span_html]
+        result = tooltip_style + " ".join(colored_text)
+    else:
+        result = tooltip_style + " ".join(colored_text)
 
     result += "</div></div>"
     return result
-
 
 def create_token_plot(
     tokens: list[str],
@@ -252,63 +232,71 @@ def create_token_plot(
     next_tokens: list[dict[str, float]] | None = None,
     normalization_method: Callable[[list[float]], list[float]] = lambda x: x,
     tokens_per_line: int = 10,
+    use_scattergl: bool = True,
+    combine_subplots: bool = False,
 ) -> go.Figure:
     """
-    Creates a plotly figure displaying tokens in groups (lines) of 'tokens_per_line',
-    with each line showing a line plot of the provided metrics over that subset of tokens.
-    Each metric has a unique color across all chunks, and the legend shows only one entry
-    per metric.
-
-    Args:
-        tokens (List[str]): The list of tokens (strings).
-        metrics (Dict[str, List[float]]): A dictionary of metric_name -> list of values
-                                          (same length as tokens).
-        normalization_method (Callable[[List[float]], List[float]]): A function
-            that takes a list of float values and returns a list of normalized
-            float values (same length).
-        tokens_per_line (int, optional): Number of tokens to display per line (subplot).
-                                         Defaults to 10.
-
-    Returns:
-        go.Figure: A Plotly figure with one row per chunk of tokens.
+    Creates a Plotly figure displaying token metrics.
+    Optimizations:
+      - Option to use go.Scattergl for WebGL-based rendering.
+      - Option to combine all tokens into a single subplot to reduce memory usage.
     """
     next_tokens = next_tokens or [None] * len(tokens)
-
-    # Create a color dictionary for each metric using a Plotly palette (or any palette you like)
-    available_colors = px.colors.qualitative.Plotly  # e.g. 10 distinct colors
+    available_colors = px.colors.qualitative.Plotly
     metric_names = list(metrics.keys())
     color_dict = {m: available_colors[i % len(available_colors)] for i, m in enumerate(metric_names)}
 
-    # Number of chunks (plot rows) we'll display
-    num_chunks = math.ceil(len(tokens) / tokens_per_line)
-
-    fig = make_subplots(rows=num_chunks, cols=1, shared_xaxes=False, shared_yaxes="all")
-
-    # Iterate over chunks
-    for chunk_index in range(num_chunks):
-        start_i = chunk_index * tokens_per_line
-        end_i = start_i + tokens_per_line
-        chunk_tokens = tokens[start_i:end_i]
-
-        # For each metric, slice the corresponding chunk of values and optionally normalize
+    if combine_subplots:
+        fig = go.Figure()
         for metric_name, metric_values in metrics.items():
-            chunk_values = metric_values[start_i:end_i]
-            normalized_chunk_values = normalization_method(chunk_values)
-            chunk_next_tokens = next_tokens[start_i:end_i]
-
-            # Create custom hover text combining token and value
-
+            normalized_values = normalization_method(metric_values)
             hover_text = [
                 (
                     "<span style='font-family: monospace;'>"
-                    + formatted_next_tokens(next_tokens, current_token, raw_value, new_line_token="<br>")
+                    + formatted_next_tokens(nt, token, raw_val, new_line_token="<br>")
                     + "</span>"
                 )
-                for current_token, next_tokens, raw_value in zip(chunk_tokens, chunk_next_tokens, chunk_values)
+                for token, nt, raw_val in zip(tokens, next_tokens, metric_values)
             ]
-
-            fig.add_trace(
-                go.Scatter(
+            trace_type = go.Scattergl if use_scattergl else go.Scatter
+            fig.add_trace(trace_type(
+                x=list(range(len(tokens))),
+                y=normalized_values,
+                mode="lines+markers",
+                name=metric_name,
+                line=dict(color=color_dict[metric_name]),
+                hovertext=hover_text,
+                hoverinfo="text",
+            ))
+        fig.update_layout(
+            height=600,
+            title="Token Metrics Plot",
+            xaxis=dict(tickmode="array", tickvals=list(range(len(tokens))), ticktext=tokens),
+            hovermode="closest",
+            margin=dict(t=30, b=10, l=10, r=10),
+        )
+        return fig
+    else:
+        num_chunks = math.ceil(len(tokens) / tokens_per_line)
+        fig = make_subplots(rows=num_chunks, cols=1, shared_xaxes=False, shared_yaxes="all")
+        for chunk_index in range(num_chunks):
+            start_i = chunk_index * tokens_per_line
+            end_i = start_i + tokens_per_line
+            chunk_tokens = tokens[start_i:end_i]
+            for metric_name, metric_values in metrics.items():
+                chunk_values = metric_values[start_i:end_i]
+                normalized_chunk_values = normalization_method(chunk_values)
+                chunk_next_tokens = next_tokens[start_i:end_i]
+                hover_text = [
+                    (
+                        "<span style='font-family: monospace;'>"
+                        + formatted_next_tokens(nt, token, raw_val, new_line_token="<br>")
+                        + "</span>"
+                    )
+                    for token, nt, raw_val in zip(chunk_tokens, chunk_next_tokens, chunk_values)
+                ]
+                trace_type = go.Scattergl if use_scattergl else go.Scatter
+                fig.add_trace(trace_type(
                     x=list(range(len(chunk_tokens))),
                     y=normalized_chunk_values,
                     mode="lines+markers",
@@ -318,31 +306,23 @@ def create_token_plot(
                     line=dict(color=color_dict[metric_name]),
                     hovertext=hover_text,
                     hoverinfo="text",
-                ),
+                ), row=chunk_index + 1, col=1)
+            fig.update_xaxes(
+                tickmode="array",
+                tickvals=list(range(len(chunk_tokens))),
+                ticktext=chunk_tokens,
                 row=chunk_index + 1,
                 col=1,
+                tickfont=dict(size=12),
             )
-
-        # Update the x-axis for this row so tick labels show the actual tokens
-        fig.update_xaxes(
-            tickmode="array",
-            tickvals=list(range(len(chunk_tokens))),
-            ticktext=chunk_tokens,
-            row=chunk_index + 1,
-            col=1,
-            tickfont=dict(size=12),
+        fig.update_layout(
+            height=250 * num_chunks,
+            showlegend=True,
+            title="Token Metrics Plot",
+            margin=dict(t=30, b=10, l=10, r=10),
+            hovermode="closest",
         )
-
-    fig.update_layout(
-        height=250 * num_chunks,
-        showlegend=True,
-        title="Token Metrics Plot",
-        margin=dict(t=30, b=10, l=10, r=10),
-        hovermode="closest",
-    )
-
-    return fig
-
+        return fig
 
 ########################
 # Streamlit interface
@@ -365,20 +345,16 @@ st.markdown(
     """
 )
 
-# 1. Button to upload a JSONL file
 uploaded_file = st.file_uploader("Upload your JSONL file", type=["jsonl"])
 
-# Prepare a space to store the loaded data
 if "data" not in st.session_state:
     st.session_state["data"] = []
 
 if uploaded_file is not None:
-    # Load the file and store it in session state
     st.session_state["data"] = load_jsonl(uploaded_file)
 
 data = st.session_state["data"]
 
-# If data is loaded, proceed
 if data:
     col1, col2 = st.columns(2)
 
@@ -386,21 +362,19 @@ if data:
         line_index = st.number_input("Line index to display", min_value=0, max_value=len(data) - 1, value=0)
         display_mode = st.radio("Display mode", ["Text Color", "Line Plot (slow)"])
 
-    # Retrieve the selected line data
     current_line = data[line_index]
 
     tokens = current_line["tokens"]
-    metrics = {m: vs for m, vs in current_line["metrics"].items()}  # e.g. {"scoreA": [...], "scoreB": [...], ...}
+    metrics = {m: vs for m, vs in current_line["metrics"].items()}
 
-    # Sanitize the tokens and next_tokens
     tokens = [escape(token) for token in tokens]
     if current_line.get("next_tokens"):
         current_line["next_tokens"] = [
-            {escape(token): prob for token, prob in next_tokens.items()} for next_tokens in current_line["next_tokens"]
+            {escape(token): prob for token, prob in next_tokens.items()}
+            for next_tokens in current_line["next_tokens"]
         ]
 
     if display_mode == "Text Color":
-        # 4. If text color is chosen, let the user pick the metric
         metric_list = list(metrics.keys())
         if metric_list:
             with col1:
@@ -412,10 +386,7 @@ if data:
                     show_annotations = st.checkbox("Show annotations", value=True)
                 else:
                     show_annotations = False
-            # Retrieve the metric values for the chosen metric
             metric_values = metrics[selected_metric.strip("`")]
-
-            # Generate HTML for colored tokens with annotations
             colored_html = color_tokens(
                 tokens,
                 metric_values,
@@ -429,14 +400,12 @@ if data:
         else:
             with col2:
                 st.warning("No metrics found in this file.")
-
     else:
-        # 5. If line plot is chosen
-        #    - Provide checkboxes to select which metrics to plot
-        #    - Radio button for normalization method
         with col1:
             normalization_method = st.radio("Normalization", ["None", "Min-max", "Z-score"])
             tokens_per_line = st.number_input("Tokens per line", min_value=3, value=20)
+            use_scattergl = st.checkbox("Use WebGL (Scattergl)", value=True)
+            combine_subplots = st.checkbox("Combine subplots into a single plot", value=False)
 
         metric_list = list(metrics.keys())
         selected_metrics = []
@@ -452,6 +421,8 @@ if data:
             normalization_method=lambda x: normalize_data(x, normalization_method),
             next_tokens=current_line.get("next_tokens"),
             tokens_per_line=tokens_per_line,
+            use_scattergl=use_scattergl,
+            combine_subplots=combine_subplots,
         )
         st.plotly_chart(fig)
 
