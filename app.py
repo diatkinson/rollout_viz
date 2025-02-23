@@ -43,6 +43,8 @@ def normalize_data(data, method):
     return data
 
 
+#cache json loading
+@st.cache_data
 def load_jsonl(file):
     """
     Read a text buffer containing JSONL data.
@@ -54,8 +56,11 @@ def load_jsonl(file):
         line = line.strip()
         if not line:
             continue
-        data = json.loads(line)
-        lines.append(data)
+        try:
+            data = json.loads(line)
+            lines.append(data)
+        except json.JSONDecodeError:
+            st.warning(f"Skipping malformed JSON line: {line[:50]}...")
     return lines
 
 
