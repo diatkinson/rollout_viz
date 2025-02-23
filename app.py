@@ -13,10 +13,10 @@ from plotly.subplots import make_subplots
 ########################
 # Helper functions
 ########################
-
-
+_COMPILED_NEWLINE_RE = re.compile(r"\n{2,}")
+#pre-compile to save time
 def escape(s: str) -> str:
-    escaped_s = re.sub("\n{2,}", "\n", html.escape(s)).replace("\n", "\\n")
+    escaped_s = _COMPILED_NEWLINE_RE.sub("\n", html.escape(s)).replace("\n", "\\n")
     return escaped_s
 
 
@@ -30,6 +30,7 @@ def format_annotations(labels):
 
 def normalize_data(data, method):
     """Normalize data using specified method"""
+    data = np.array(data, dtype=float)
     if method == "Min-max":
         if np.max(data) == np.min(data):
             return np.ones_like(data) * 0.5
